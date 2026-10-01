@@ -1,0 +1,47 @@
+name: Veille Deal Sentinel
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      test_telegram:
+        description: "Envoyer un message de test sur Telegram"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Télécharger le projet
+        uses: actions/checkout@v4
+      - name: Préparer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Récupérer l'historique des alertes
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: veille-state-${{ github.run_id }}
+          restore-keys: veille-state-
+      - name: Tester Telegram
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.test_telegram }}
+        run: python agent.py --test
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      - name: Chercher les offres
+        run: python agent.py --once
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DEALABS_RSS_URL: ${{ secrets.DEALABS_RSS_URL }}
+          DEALABS_RSS_NAME: Dealabs
+          RSS_MAX_PRICE_EUR: ${{ vars.RSS_MAX_PRICE_EUR }}
