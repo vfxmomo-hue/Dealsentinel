@@ -113,6 +113,9 @@ def keepa_deals(config: dict, env: dict):
             if not isinstance(avg90_row[0], (int, float)) or avg90_row[0] <= 0:
                 continue
             price, avg90 = current[0] / 100.0, avg90_row[0] / 100.0
+            ceiling = price_limit_for_title(title, config)
+            if ceiling is not None and price > ceiling:
+                continue
             drop = (1 - price / avg90) * 100
             if drop < threshold:
                 continue
@@ -167,6 +170,16 @@ def price_from_text(text: str):
         return None
 
 
+def price_limit_for_title(title: str, config: dict, fallback=None):
+    """Return the category-specific ceiling matching this offer title."""
+    text = title.casefold()
+    limits = config.get("price_limits_by_keyword", {})
+    matched = [float(limit) for keyword, limit in limits.items() if keyword.casefold() in text]
+    if matched:
+        return min(matched)
+    return fallback
+
+
 def rss_candidates(config: dict, env: dict):
     found = []
     feeds = list(config.get("rss_feeds", []))
@@ -192,7 +205,7 @@ def rss_candidates(config: dict, env: dict):
                     continue
                 # Un flux RSS n'apporte pas à lui seul un historique fiable.
                 # On alerte seulement si le prix est inférieur au seuil configuré.
-                ceiling = feed.get("max_price_eur")
+                ceiling = price_limit_for_title(item["title"], config, feed.get("max_price_eur"))
                 if ceiling is None or price > float(ceiling):
                     continue
                 found.append({"key": f"rss:{item['guid']}", "title": item["title"], "price": price,
