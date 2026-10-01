@@ -7,6 +7,11 @@
     "playstation 5 slim",
     "ps5"
   ],
+  "price_limits_by_keyword": {
+    "iphone": 800,
+    "playstation 5": 450,
+    "ps5": 450
+  },
   "exclude_keywords": [
     "coque",
     "étui",
