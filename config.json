@@ -1,0 +1,32 @@
+{
+  "check_interval_seconds": 300,
+  "min_drop_percent": 40,
+  "keywords": [
+    "iphone",
+    "playstation 5",
+    "playstation 5 slim",
+    "ps5"
+  ],
+  "exclude_keywords": [
+    "coque",
+    "étui",
+    "etui",
+    "verre trempé",
+    "protection écran",
+    "case",
+    "manette",
+    "controller",
+    "skin",
+    "reconditionné",
+    "reconditionnee",
+    "refurbished",
+    "renewed",
+    "occasion",
+    "d'occasion"
+  ],
+  "rss_feeds": [],
+  "keepa_search_phrases": [
+    "iphone",
+    "ps5"
+  ]
+}

@@ -1,0 +1,14 @@
+services:
+  - type: worker
+    name: deal-sentinel
+    runtime: python
+    plan: starter
+    buildCommand: echo "No extra packages required"
+    startCommand: python3 agent.py
+    envVars:
+      - key: KEEPA_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
