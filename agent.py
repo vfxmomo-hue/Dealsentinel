@@ -508,7 +508,113 @@ class ProductPage(HTMLParser):
 
 
 def schema_type(value):
+    if isinstance(value, dict):
+        value = value.get("@id") or value.get("name")
     return str(value or "").rstrip("/").rsplit("/", 1)[-1].rsplit("#", 1)[-1]
+
+
+def individual_offers(value):
+    """An AggregateOffer's lowPrice is not payable; explicit child Offers are."""
+    if isinstance(value, list):
+        for child in value:
+            yield from individual_offers(child)
+    elif isinstance(value, dict):
+        if schema_type(value.get("@type")) == "AggregateOffer":
+            if offer_restriction(value):
+                return
+            if value.get("itemCondition") and schema_type(value["itemCondition"]) != "NewCondition":
+                return
+            yield from individual_offers(value.get("offers"))
+        else:
+            yield value
+
+
+class EvidencePage(HTMLParser):
+    """Collect public visible price/condition blocks, never scripts or inputs."""
+    VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.stack, self.blocks, self.titles = [], [], []
+        self.hidden = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.VOID:
+            return
+        a = dict(attrs)
+        hidden = tag in {"script", "style", "noscript"}
+        if hidden:
+            self.hidden += 1
+        label = " ".join(str(a.get(k, "")) for k in ("id", "class", "itemprop", "data-testid"))[:250]
+        selected = tag in {"h1", "title"} or bool(re.search(
+            r"price|prix|condition|offer|seller|merchant|buybox|availability|stock|sold|neuf|productTitle", label, re.I))
+        self.stack.append({"tag": tag, "label": label, "text": [], "length": 0,
+                           "selected": selected, "hidden": hidden})
+
+    def handle_data(self, data):
+        if self.hidden:
+            return
+        for frame in self.stack:
+            if frame["selected"] and frame["length"] < 1600:
+                frame["text"].append(data[:1600-frame["length"]])
+                frame["length"] += len(data)
+
+    def handle_endtag(self, tag):
+        if tag in self.VOID:
+            return
+        index = next((i for i in range(len(self.stack)-1, -1, -1) if self.stack[i]["tag"] == tag), None)
+        if index is None:
+            return
+        for frame in self.stack[index:]:
+            if frame["hidden"]:
+                self.hidden = max(0, self.hidden - 1)
+            text = " ".join(" ".join(frame["text"]).split())
+            if frame["tag"] in {"h1", "title"} and text:
+                self.titles.append(text[:300])
+            if frame["selected"] and text and len(self.blocks) < 60:
+                self.blocks.append({"tag": frame["tag"], "selector": frame["label"], "text": text[:1200]})
+        del self.stack[index:]
+
+
+def public_price_fields(value, depth=0):
+    """Whitelist product fields so diagnostics cannot include arbitrary tokens."""
+    allowed = {"@type", "@id", "name", "sku", "gtin", "gtin13", "itemCondition", "availability",
+               "price", "priceCurrency", "lowPrice", "highPrice", "offers", "seller", "priceSpecification",
+               "validForMemberTier", "eligibleCustomerType", "validThrough", "priceValidUntil",
+               "businessFunction", "value", "propertyID", "additionalProperty"}
+    if depth > 7:
+        return "[limite]"
+    if isinstance(value, dict):
+        return {k: public_price_fields(v, depth+1) for k, v in value.items() if k in allowed}
+    if isinstance(value, list):
+        return [public_price_fields(v, depth+1) for v in value[:12]]
+    if isinstance(value, str):
+        # @id often contains a public product URL: omit tracking query strings.
+        if value.startswith(("https://", "http://")):
+            p = urlsplit(value)
+            return urllib.parse.urlunsplit((p.scheme, p.hostname or "", p.path, "", p.fragment))[:400]
+        return value[:400]
+    return value
+
+
+def emit_source_evidence(retailer, url, page="", *, status=None, reason=None):
+    parser = ProductPage()
+    parser.feed(page)
+    visible = EvidencePage()
+    visible.feed(page)
+    parts = urlsplit(url)
+    evidence = {"retailer": retailer, "path": parts.path, "http_status": status,
+                "reason": reason, "titles": visible.titles[:3],
+                "products": [public_price_fields(p) for doc in parser.documents for p in products_in(doc)][:4],
+                "blocks": visible.blocks[:40]}
+    # Keep valid JSON even on large pages, with a bounded per-page log entry.
+    encoded = json.dumps(evidence, ensure_ascii=False)
+    while len(encoded) > 16000 and evidence["blocks"]:
+        evidence["blocks"].pop()
+        encoded = json.dumps(evidence, ensure_ascii=False)
+    while len(encoded) > 24000 and evidence["products"]:
+        evidence["products"].pop()
+        encoded = json.dumps(evidence, ensure_ascii=False)
+    print("SOURCE_EVIDENCE " + encoded, flush=True)
 
 
 def products_in(document):
@@ -594,8 +700,9 @@ def retailer_candidates(page, url, retailer, config):
         if NON_NEW.search(normalized(product.get("description", ""))) or conditional_price(product.get("description", "")):
             rejected["description_sous_conditions"] += 1
             continue
-        offers = product.get("offers", [])
-        offers = offers if isinstance(offers, list) else [offers]
+        offers = list(individual_offers(product.get("offers", [])))
+        if not offers:
+            rejected["offre_agregee_ou_incomplete"] += 1
         for offer in offers:
             if not isinstance(offer, dict) or schema_type(offer.get("@type")) != "Offer":
                 rejected["offre_agregee_ou_incomplete"] += 1
@@ -648,6 +755,7 @@ def scan_retailer(retailer, config, cursor=0):
     source = RETAILERS[retailer]
     deadline = time.monotonic() + 55
     counts = Counter()
+    evidence_remaining = 2 if config.get("source_evidence", True) else 0
     queue = list(source["products"])
     queue.extend(config.get("retailer_product_urls", {}).get(retailer, []))
     for url in source["discover"]:
@@ -663,7 +771,8 @@ def scan_retailer(retailer, config, cursor=0):
             counts["pages_decouverte_lues"] += 1
         except Exception as exc:
             counts["erreurs_acces"] += 1
-            print(f"[{retailer}] Découverte inaccessible ({type(exc).__name__}).")
+            status = getattr(exc, "code", None)
+            print(f"[{retailer}] Découverte inaccessible ({type(exc).__name__}, HTTP {status}).")
     queue = list(dict.fromkeys(u for u in queue if retailer_url(u, retailer, product=True)))
     if queue:
         offset = cursor % len(queue)
@@ -679,14 +788,30 @@ def scan_retailer(retailer, config, cursor=0):
             page, final_url = fetch_retail_page(url, retailer)
             if product_id(final_url, retailer) != product_id(url, retailer):
                 counts["redirection_non_produit"] += 1
+                if evidence_remaining:
+                    emit_source_evidence(retailer, final_url, page, status=200, reason="redirection_non_produit")
+                    evidence_remaining -= 1
                 continue
             deals, reasons = retailer_candidates(page, final_url, retailer, config)
+            if evidence_remaining:
+                emit_source_evidence(retailer, final_url, page, status=200, reason=dict(reasons))
+                evidence_remaining -= 1
             found.extend(deals)
             counts.update(reasons)
             counts["fiches_lues"] += 1
         except Exception as exc:
             counts["erreurs_acces"] += 1
-            print(f"[{retailer}] Fiche inaccessible ({type(exc).__name__}).")
+            status = getattr(exc, "code", None)
+            print(f"[{retailer}] Fiche inaccessible ({type(exc).__name__}, HTTP {status}).")
+            if evidence_remaining:
+                body = ""
+                if isinstance(exc, urllib.error.HTTPError):
+                    try:
+                        body = exc.read(100000).decode("utf-8", errors="replace")
+                    except OSError:
+                        pass
+                emit_source_evidence(retailer, url, body, status=status, reason=type(exc).__name__)
+                evidence_remaining -= 1
     counts["offres_retenues"] = len(found)
     print(f"[{retailer}] Diagnostic : {json.dumps(dict(counts), ensure_ascii=False)}")
     return found, cursor + checked
