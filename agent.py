@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Deal Sentinel — surveille les anomalies de prix Keepa et des flux RSS.
+"""Deal Sentinel — veille multi-boutiques gratuite, neuf et sans conditions.
 
-Fonctionne avec la bibliothèque standard Python. Les alertes partent sur Telegram.
+Bibliothèque standard Python uniquement. --diagnose ne publie aucun message.
+Les lecteurs de boutiques utilisent les données Product/Offer schema.org.
+Leur fonctionnement sur les sites réels doit être contrôlé dans les diagnostics.
 """
 from __future__ import annotations
 import json, os, re, sys, time, urllib.parse, urllib.request, urllib.error
@@ -13,6 +15,8 @@ from html import unescape
 from html.parser import HTMLParser
 import unicodedata
 from urllib.parse import urlsplit
+from concurrent.futures import ThreadPoolExecutor
+from collections import Counter
 
 
 def plain_text(value):
@@ -39,7 +43,43 @@ CONDITIONAL_PRICE = re.compile(
 def conditional_price(*texts):
     # Dealabs may display a net price after deferred rewards. Without an
     # independently verified upfront amount, these offers must be skipped.
-    return any(CONDITIONAL_PRICE.search(normalized(t)) for t in texts)
+    for text in texts:
+        text = normalized(text)
+        text = re.sub(r"\bsans (?:abonnement|forfait|engagement|reprise|odr|condition)\b", "", text)
+        if CONDITIONAL_PRICE.search(text) or re.search(
+            r"\b(?:joyplus|prime|membre|nouveau client|nouveaux clients|etudiant|financement|credit)\b"
+            r"|\b(?:code|coupon)\s+(?:promo|promotionnel|obligatoire)\b", text):
+            return True
+    return False
+
+
+NON_NEW = re.compile(r"\b(?:recondition\w*|refurbish\w*|renewed|occasion|used|seconde main|"
+                     r"comme neuf|open box|deballe\w*|retour client|grade [abc]|endommage\w*)\b")
+
+
+def target_product(title, config):
+    text = normalized(title)
+    if NON_NEW.search(text) or conditional_price(text):
+        return False
+    # Reject accessories and games, even if they mention a target device.
+    if re.search(r"\b(?:coque|etui|protection|verre trempe|chargeur|cable|casque|ecouteur|batterie|"
+                 r"figurine|sticker|skin|support|station|lecteur|housse)\b", text):
+        if not (re.search(r"\bconsole\b", text) and re.search(r"\bavec lecteur\b", text)
+                and not re.search(r"\b(?:coque|etui|housse|support|station)\b", text)):
+            return False
+    iphone = re.search(r"\biphone\s*(\d{1,2})(?:e)?\b", text)
+    if iphone or re.search(r"\biphone air\b", text):
+        if re.search(r"\b(?:pour|compatible|accessoire)\b", text):
+            return False
+        return not iphone or int(iphone.group(1)) >= int(config.get("min_iphone_generation", 16))
+    if re.search(r"\b(?:ps5|playstation\s*5)\b", text):
+        if re.search(r"\b(?:portal|vr2|accessoire|compatible|pour)\b", text):
+            return False
+        if re.search(r"\bconsole\b", text):
+            return True
+        return bool(re.fullmatch(r"(?:sony\s+)?(?:playstation\s*5|ps5)"
+                                 r"(?:\s+(?:slim|pro|digital|standard|edition|numerique|blanc|noir|go|to|gb|tb|\d+))*", text))
+    return False
 
 
 def euro_amount(value):
@@ -112,6 +152,11 @@ def verified_dealabs_price(page, item):
                         thread.get("content", ""), thread.get("descriptionHtml", "")]
         if conditional_price(thread.get("title", ""), *descriptions):
             return None
+        if any(NON_NEW.search(normalized(t)) for t in descriptions):
+            return None
+        condition = thread.get("itemCondition") or thread.get("condition")
+        if schema_type(condition) not in ("NewCondition", "new", "neuf") and not has_keyword(thread.get("title", ""), "neuf"):
+            return None
         if thread.get("isExpired") or thread.get("isDeleted") or thread.get("status") in ("expired", "deleted"):
             return None
         if thread.get("discountType") is not None and thread.get("discountType") != "":
@@ -176,9 +221,15 @@ def read_env():
 
 
 def matches(title: str, config: dict) -> bool:
-    if any(has_keyword(title, x) for x in config.get("exclude_keywords", [])):
+    if not target_product(title, config):
         return False
-    return any(has_keyword(title, x) for x in config.get("keywords", []))
+    for word in config.get("exclude_keywords", []):
+        # A console bundle legitimately includes a controller.
+        if normalized(word) in {"manette", "controller"} and has_keyword(title, "console"):
+            continue
+        if has_keyword(title, word):
+            return False
+    return True
 
 
 def keepa_deals(config: dict, env: dict):
@@ -332,6 +383,339 @@ def rss_candidates(config: dict, env: dict):
     return found
 
 
+RETAILERS = {
+    "Carrefour": {
+        "hosts": {"www.carrefour.fr", "carrefour.fr"}, "path": r"/p/[^/]+-\d+",
+        "discover": ["https://www.carrefour.fr/s?q=iphone+17", "https://www.carrefour.fr/s?q=ps5"],
+        "products": [
+            "https://www.carrefour.fr/p/iphone-17-256-go-noir-mg6j4f-a-apple-0195950643435",
+            "https://www.carrefour.fr/p/iphone-17-256-go-brume-mg6l4f-a-apple-0195950643831",
+            "https://www.carrefour.fr/p/console-ps5-slim-sony-0711719577171"],
+    },
+    "E.Leclerc": {
+        "hosts": {"www.e.leclerc", "e.leclerc"}, "path": r"/fp/[^/]+-\d+",
+        "discover": ["https://www.e.leclerc/cat/iphone"],
+        "products": [
+            "https://www.e.leclerc/fp/apple-iphone-17-16-cm-6-3-double-sim-ios-26-5g-usb-type-c-256-go-noir-0195950643435",
+            "https://www.e.leclerc/fp/apple-iphone-17-16-cm-6-3-double-sim-ios-26-5g-usb-type-c-256-go-lavande-0195950644036",
+            "https://www.e.leclerc/fp/console-playstation-5-edition-standard-modele-slim-ps5-0711719021247",
+            "https://www.e.leclerc/fp/pack-console-edition-numerique-playstation-5-fortnite-cobalt-star-modele-slim-ps5-0711719593560"],
+    },
+    "Joybuy": {
+        "hosts": {"www.joybuy.fr", "m.joybuy.fr", "joybuy.fr"}, "path": r"/dp/(?:[^/]+/)?\d+",
+        "discover": ["https://www.joybuy.fr/cms/iphone17-hp-banner-0912", "https://www.joybuy.fr/cms/consoles-et-jeux-video"],
+        "products": [
+            "https://www.joybuy.fr/dp/apple-iphone-17-256-go-blanc/10408701",
+            "https://m.joybuy.fr/dp/10408705",
+            "https://m.joybuy.fr/dp/10444422"],
+    },
+    "Amazon": {
+        "hosts": {"www.amazon.fr", "amazon.fr"}, "path": r"/(?:[^/]+/)?dp/[A-Z0-9]{10}",
+        "discover": [],
+        "products": ["https://www.amazon.fr/Apple-iPhone-Pro-512-prodigieuse/dp/B0FQH2B7G3"],
+    },
+}
+
+
+def retailer_url(url, retailer, *, product=False):
+    """Validate hosts and keep offer/variant parameters (never mix SKUs)."""
+    try:
+        p = urlsplit(url)
+        if p.scheme != "https" or p.hostname not in RETAILERS[retailer]["hosts"]:
+            return None
+        if p.username or p.password or p.port not in (None, 443):
+            return None
+        if product and not re.fullmatch(RETAILERS[retailer]["path"], p.path.rstrip("/")):
+            return None
+        query = urllib.parse.urlencode([(k, v) for k, v in urllib.parse.parse_qsl(p.query)
+                                       if k in {"offerId", "ref_sku", "s", "q", "page", "th", "psc"}])
+        return urllib.parse.urlunsplit(("https", p.hostname, p.path.rstrip("/"), query, ""))
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def product_id(url, retailer):
+    url = retailer_url(url, retailer, product=True)
+    if not url:
+        return None
+    p = urlsplit(url)
+    if retailer == "Amazon":
+        identity = p.path.rsplit("/", 1)[-1]
+    elif retailer == "Joybuy":
+        identity = dict(urllib.parse.parse_qsl(p.query)).get("ref_sku") or p.path.rsplit("/", 1)[-1]
+    else:
+        identity = p.path.rsplit("-", 1)[-1]
+    return identity
+
+
+def fetch_retail_page(url, retailer):
+    class SafeRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            if not retailer_url(newurl, retailer):
+                raise ValueError("Redirection hors de la boutique")
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+    if not retailer_url(url, retailer):
+        raise ValueError("URL boutique invalide")
+    req = urllib.request.Request(url, headers={"User-Agent": "DealSentinel/2.0 (personal price monitor)",
+                                              "Accept-Language": "fr-FR,fr;q=0.9"})
+    with urllib.request.build_opener(SafeRedirect()).open(req, timeout=6) as response:
+        raw = response.read(3_000_001)
+        if len(raw) > 3_000_000:
+            raise ValueError("Page trop volumineuse")
+        return raw.decode(response.headers.get_content_charset() or "utf-8", errors="replace"), response.url
+
+
+class ProductPage(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.documents, self.links, self.headings = [], [], []
+        self.script = None
+        self.h1 = False
+        self.anchor = None
+        self.canonical = None
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "script" and a.get("type", "").lower() == "application/ld+json":
+            self.script = []
+        if tag == "h1":
+            self.h1 = True
+        if tag == "a" and a.get("href"):
+            self.anchor = [a["href"], a.get("title", "")]
+        if tag == "link" and a.get("rel") == "canonical":
+            self.canonical = a.get("href")
+
+    def handle_data(self, data):
+        if self.script is not None:
+            self.script.append(data)
+        elif self.h1:
+            self.headings.append(data)
+        if self.anchor is not None and self.script is None:
+            self.anchor[1] += " " + data
+
+    def handle_endtag(self, tag):
+        if tag == "script" and self.script is not None:
+            try:
+                self.documents.append(json.loads("".join(self.script)))
+            except ValueError:
+                pass
+            self.script = None
+        if tag == "h1":
+            self.h1 = False
+        if tag == "a" and self.anchor is not None:
+            self.links.append(tuple(self.anchor))
+            self.anchor = None
+
+
+def schema_type(value):
+    return str(value or "").rstrip("/").rsplit("/", 1)[-1].rsplit("#", 1)[-1]
+
+
+def products_in(document):
+    if isinstance(document, list):
+        for entry in document:
+            yield from products_in(entry)
+    elif isinstance(document, dict):
+        types = document.get("@type", [])
+        types = types if isinstance(types, list) else [types]
+        if "Product" in [schema_type(t) for t in types]:
+            yield document
+        # Graphs and variants are explicit structures; recommendations are not
+        # recursively treated as the product belonging to this page.
+        for field in ("@graph", "hasVariant"):
+            yield from products_in(document.get(field))
+
+
+def offer_restriction(offer):
+    if not isinstance(offer, dict):
+        return True
+    if conditional_price(offer.get("name"), offer.get("description")):
+        return True
+    if NON_NEW.search(normalized(offer.get("name"))) or NON_NEW.search(normalized(offer.get("description"))):
+        return True
+    if any(offer.get(k) for k in ("validForMemberTier", "eligibleCustomerType", "eligibleDuration",
+                                 "billingDuration", "billingIncrement", "leaseLength", "eligibleTransactionVolume")):
+        return True
+    if offer.get("availableAtOrFrom") or offer.get("ineligibleRegion"):
+        return True
+    region = offer.get("eligibleRegion")
+    if region is not None and region not in ("FR", "France"):
+        return True
+    if offer.get("businessFunction") and schema_type(offer["businessFunction"]) != "Sell":
+        return True
+    quantity = offer.get("eligibleQuantity")
+    if quantity is not None and quantity not in ({"value": 1}, {"minValue": 1, "maxValue": 1}):
+        return True
+    specs = offer.get("priceSpecification", [])
+    specs = specs if isinstance(specs, list) else [specs]
+    for spec in specs:
+        if not isinstance(spec, dict) or any(spec.get(k) for k in (
+            "validForMemberTier", "eligibleCustomerType", "billingDuration", "billingIncrement",
+            "priceType", "unitCode", "referenceQuantity")):
+            return True
+        if conditional_price(spec.get("name"), spec.get("description")):
+            return True
+        if "price" in spec and euro_amount(spec["price"]) != euro_amount(offer.get("price")):
+            return True
+    expiry = offer.get("priceValidUntil") or offer.get("validThrough")
+    if expiry:
+        try:
+            if datetime.fromisoformat(str(expiry).replace("Z", "+00:00")).date() < datetime.now(timezone.utc).date():
+                return True
+        except ValueError:
+            return True
+    return False
+
+
+def retailer_candidates(page, url, retailer, config):
+    parser = ProductPage()
+    parser.feed(page)
+    identity = product_id(url, retailer)
+    rejected = Counter()
+    found = []
+    products = [p for doc in parser.documents for p in products_in(doc)]
+    if not products:
+        return [], Counter({"donnees_produit_absentes": 1})
+    for product in products:
+        title = plain_text(product.get("name", "")).strip()
+        if not matches(title, config):
+            rejected["modele_etat_ou_condition_exclus"] += 1
+            continue
+        product_url = urllib.parse.urljoin(url, str(product.get("url") or product.get("@id") or ""))
+        # A URL or a matching main heading is required to ignore recommendation
+        # blocks and prove this price belongs to the product being monitored.
+        if product.get("url") or product.get("@id"):
+            if product_id(product_url, retailer) != identity:
+                rejected["identite_produit_incoherente"] += 1
+                continue
+        elif normalized(" ".join(parser.headings)) != normalized(title):
+            rejected["identite_produit_non_confirmee"] += 1
+            continue
+        if NON_NEW.search(normalized(product.get("description", ""))) or conditional_price(product.get("description", "")):
+            rejected["description_sous_conditions"] += 1
+            continue
+        offers = product.get("offers", [])
+        offers = offers if isinstance(offers, list) else [offers]
+        for offer in offers:
+            if not isinstance(offer, dict) or schema_type(offer.get("@type")) != "Offer":
+                rejected["offre_agregee_ou_incomplete"] += 1
+                continue
+            if offer_restriction(offer):
+                rejected["prix_sous_conditions"] += 1
+                continue
+            condition = offer.get("itemCondition", product.get("itemCondition"))
+            if schema_type(condition) != "NewCondition":
+                rejected["etat_neuf_non_confirme"] += 1
+                continue
+            if schema_type(offer.get("availability")) != "InStock":
+                rejected["stock_non_confirme"] += 1
+                continue
+            price = euro_amount(offer.get("price"))
+            if offer.get("priceCurrency") != "EUR" or price is None:
+                rejected["prix_eur_non_confirme"] += 1
+                continue
+            ceiling = price_limit_for_title(title, config)
+            if ceiling is None or price > ceiling:
+                rejected["au_dessus_du_seuil"] += 1
+                continue
+            seller = offer.get("seller")
+            seller = seller.get("name", "") if isinstance(seller, dict) else seller
+            if not isinstance(seller, str) or not seller.strip():
+                rejected["vendeur_non_confirme"] += 1
+                continue
+            offer_url = urllib.parse.urljoin(url, str(offer.get("url") or product_url))
+            if product_id(offer_url, retailer) != identity:
+                rejected["lien_offre_incoherent"] += 1
+                continue
+            offer_url = retailer_url(offer_url, retailer, product=True)
+            found.append({"key": f"direct:{retailer}:{identity}:{seller}:{offer_url}",
+                          "title": title, "price": price, "reference": None, "drop": None,
+                          "url": offer_url, "source": retailer, "seller": seller,
+                          "condition": "Neuf", "direct": True})
+    # Different prices for the very same seller/offer are ambiguous, not a
+    # reason to pick whichever number is lowest.
+    by_key = {}
+    conflicts = set()
+    for deal in found:
+        if deal["key"] in by_key and by_key[deal["key"]]["price"] != deal["price"]:
+            conflicts.add(deal["key"])
+        by_key[deal["key"]] = deal
+    rejected["prix_contradictoires"] += len(conflicts)
+    return [d for k, d in by_key.items() if k not in conflicts], rejected
+
+
+def scan_retailer(retailer, config, cursor=0):
+    source = RETAILERS[retailer]
+    deadline = time.monotonic() + 55
+    counts = Counter()
+    queue = list(source["products"])
+    queue.extend(config.get("retailer_product_urls", {}).get(retailer, []))
+    for url in source["discover"]:
+        try:
+            page, final_url = fetch_retail_page(url, retailer)
+            parser = ProductPage()
+            parser.feed(page)
+            for href, text in parser.links:
+                product_url = retailer_url(urllib.parse.urljoin(final_url, href), retailer, product=True)
+                label = text + " " + urllib.parse.unquote(href).replace("-", " ")
+                if product_url and target_product(label, config):
+                    queue.append(product_url)
+            counts["pages_decouverte_lues"] += 1
+        except Exception as exc:
+            counts["erreurs_acces"] += 1
+            print(f"[{retailer}] Découverte inaccessible ({type(exc).__name__}).")
+    queue = list(dict.fromkeys(u for u in queue if retailer_url(u, retailer, product=True)))
+    if queue:
+        offset = cursor % len(queue)
+        queue = queue[offset:] + queue[:offset]
+    found = []
+    checked = 0
+    for url in queue[:8]:
+        if time.monotonic() >= deadline:
+            counts["temps_limite"] += 1
+            break
+        checked += 1
+        try:
+            page, final_url = fetch_retail_page(url, retailer)
+            if product_id(final_url, retailer) != product_id(url, retailer):
+                counts["redirection_non_produit"] += 1
+                continue
+            deals, reasons = retailer_candidates(page, final_url, retailer, config)
+            found.extend(deals)
+            counts.update(reasons)
+            counts["fiches_lues"] += 1
+        except Exception as exc:
+            counts["erreurs_acces"] += 1
+            print(f"[{retailer}] Fiche inaccessible ({type(exc).__name__}).")
+    counts["offres_retenues"] = len(found)
+    print(f"[{retailer}] Diagnostic : {json.dumps(dict(counts), ensure_ascii=False)}")
+    return found, cursor + checked
+
+
+def collect_candidates(config, env, state):
+    cursors = state.get("_retailer_cursors", {})
+    if not isinstance(cursors, dict):
+        cursors = {}
+    enabled = [s for s in config.get("retailers", list(RETAILERS)) if s in RETAILERS]
+    found = []
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        rss_job = pool.submit(rss_candidates, config, env)
+        jobs = [(name, pool.submit(scan_retailer, name, config, int(cursors.get(name, 0)))) for name in enabled]
+        for name, job in jobs:
+            try:
+                deals, cursor = job.result()
+                found.extend(deals)
+                cursors[name] = cursor
+            except Exception as exc:
+                print(f"[{name}] Vérification interrompue ({type(exc).__name__}).")
+        found.extend(rss_job.result())
+    state["_retailer_cursors"] = cursors
+    # The free mode makes no paid Keepa API requests. Explicit opt-in only.
+    if config.get("enable_keepa", False):
+        print("Keepa désactivé en mode strict : état neuf et conditions non vérifiés par ce lecteur.")
+    return found
+
+
 def should_alert(deal: dict, state: dict, config: dict):
     old = state.get(deal["key"])
     now = time.time()
@@ -343,7 +727,12 @@ def should_alert(deal: dict, state: dict, config: dict):
 
 
 def format_alert(d: dict):
-    if d.get("reference"):
+    if d.get("direct"):
+        detail = (f"Prix article : {d['price']:.2f} €\nÉtat déclaré : neuf — En stock\n"
+                  f"Vendeur : {d['seller']}\nPrix public, sans avantage différé déduit\n"
+                  "Seuil atteint hors livraison ; frais à vérifier")
+        label = "🔎 Offre repérée chez un marchand"
+    elif d.get("reference"):
         detail = f"Prix actuel : {d['price']:.2f} €\nMoyenne Keepa sur 90 jours : {d['reference']:.2f} €\nÉcart : −{d['drop']:.0f} %"
         label = "🚨 Grosse anomalie de prix à vérifier"
     else:
@@ -353,12 +742,7 @@ def format_alert(d: dict):
 
 
 def check_once(config, env, state):
-    candidates = []
-    try:
-        candidates.extend(keepa_deals(config, env))
-    except Exception as exc:
-        print(f"Keepa inaccessible : {exc}")
-    candidates.extend(rss_candidates(config, env))
+    candidates = collect_candidates(config, env, state)
     sent = 0
     for deal in candidates:
         if not should_alert(deal, state, config):
@@ -378,6 +762,10 @@ def main():
     config = load_json(CONFIG_PATH, {})
     env = read_env()
     state = load_json(STATE_PATH, {})
+    if "--diagnose" in sys.argv:
+        candidates = collect_candidates(config, env, {})
+        print(f"Diagnostic terminé : {len(candidates)} offre(s). Aucun message Telegram envoyé.")
+        return
     if "--test" in sys.argv:
         send_telegram("✅ Deal Sentinel est connecté. Les alertes arriveront ici.", env)
         print("Message de test envoyé.")
