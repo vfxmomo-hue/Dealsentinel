@@ -8,6 +8,122 @@ import json, os, re, sys, time, urllib.parse, urllib.request, urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 import xml.etree.ElementTree as ET
+from decimal import Decimal, InvalidOperation
+from html import unescape
+from html.parser import HTMLParser
+import unicodedata
+from urllib.parse import urlsplit
+
+
+def plain_text(value):
+    return unescape(re.sub(r"<[^>]*>", " ", str(value or "")))
+
+
+def normalized(value):
+    text = unicodedata.normalize("NFKD", plain_text(value).casefold())
+    return " ".join("".join(c for c in text if not unicodedata.combining(c)).split())
+
+
+def has_keyword(text, keyword):
+    return re.search(r"(?<!\w)" + re.escape(normalized(keyword)) + r"(?!\w)", normalized(text)) is not None
+
+
+CONDITIONAL_PRICE = re.compile(
+    r"\b(?:cagnott\w*|cash\s*back|odr|rembours\w*|reprise|abonnement|forfait|"
+    r"fidelit\w*|adherent\w*|infinity|parrain\w*|location|mensualit\w*)\b|\bclub\s*\+"
+    r"|\bbon(?:s)?\s+d['’ ]achat\b|\bcarte\s+cadeau\b"
+    r"|(?:€|eur)\s*/\s*(?:mois|month)\b"
+)
+
+
+def conditional_price(*texts):
+    # Dealabs may display a net price after deferred rewards. Without an
+    # independently verified upfront amount, these offers must be skipped.
+    return any(CONDITIONAL_PRICE.search(normalized(t)) for t in texts)
+
+
+def euro_amount(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    raw = str(value).strip().replace("\u00a0", " ").replace("\u202f", " ")
+    if re.fullmatch(r"\d{1,3}(?:[ .]\d{3})+(?:,\d{1,2})?", raw):
+        raw = raw.replace(" ", "").replace(".", "").replace(",", ".")
+    elif re.fullmatch(r"\d+(?:[,.]\d{1,2})?", raw):
+        raw = raw.replace(",", ".")
+    else:
+        return None
+    try:
+        amount = Decimal(raw)
+    except InvalidOperation:
+        return None
+    return float(amount) if amount.is_finite() and 1 <= amount <= 20000 else None
+
+
+def dealabs_id(url):
+    try:
+        parsed = urlsplit(url)
+        if parsed.scheme != "https" or parsed.hostname not in {"dealabs.com", "www.dealabs.com"}:
+            return None
+        if parsed.username or parsed.password or parsed.port not in {None, 443}:
+            return None
+    except ValueError:
+        return None
+    match = re.fullmatch(r"/bons-plans/[^/]+-(\d+)/?", parsed.path)
+    return match.group(1) if match else None
+
+
+class DealabsData(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.threads = []
+
+    def handle_starttag(self, tag, attrs):
+        data = dict(attrs).get("data-vue3")
+        if not data:
+            return
+        try:
+            payload = json.loads(data)
+        except (ValueError, TypeError):
+            return
+        if isinstance(payload, dict) and isinstance(payload.get("props"), dict):
+            thread = payload["props"].get("thread")
+            if isinstance(thread, dict):
+                self.threads.append(thread)
+
+
+def verified_dealabs_price(page, item):
+    """Only read props.thread.price belonging to this exact deal and title.
+
+    No fallback to description numbers, JSON recommendations, reference prices,
+    discounts, cashback, delivery amounts, or the title is allowed.
+    """
+    thread_id = dealabs_id(item.get("link", ""))
+    if thread_id is None:
+        return None
+    parser = DealabsData()
+    parser.feed(page)
+    prices = set()
+    for thread in parser.threads:
+        if str(thread.get("threadId")) != thread_id:
+            continue
+        if normalized(thread.get("title")) != normalized(item.get("title")):
+            return None
+        descriptions = [item.get("description", ""), thread.get("description", ""),
+                        thread.get("content", ""), thread.get("descriptionHtml", "")]
+        if conditional_price(thread.get("title", ""), *descriptions):
+            return None
+        if thread.get("isExpired") or thread.get("isDeleted") or thread.get("status") in ("expired", "deleted"):
+            return None
+        if thread.get("discountType") is not None and thread.get("discountType") != "":
+            return None
+        if thread.get("currency", "EUR") not in ("EUR", "€"):
+            return None
+        price = euro_amount(thread.get("price"))
+        if price is None:
+            return None
+        prices.add(price)
+    return prices.pop() if len(prices) == 1 else None
+
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.json"
@@ -60,11 +176,9 @@ def read_env():
 
 
 def matches(title: str, config: dict) -> bool:
-    text = title.casefold()
-    excluded = [x.casefold() for x in config.get("exclude_keywords", [])]
-    if any(x in text for x in excluded):
+    if any(has_keyword(title, x) for x in config.get("exclude_keywords", [])):
         return False
-    return any(x.casefold() in text for x in config.get("keywords", []))
+    return any(has_keyword(title, x) for x in config.get("keywords", []))
 
 
 def keepa_deals(config: dict, env: dict):
@@ -138,43 +252,22 @@ def parse_feed(url: str):
         fields = {}
         for child in list(el):
             name = child.tag.rsplit("}", 1)[-1].lower()
-            fields[name] = (child.text or "").strip()
+            fields[name] = "".join(child.itertext()).strip()
             if name == "link" and not fields[name]:
                 fields[name] = child.attrib.get("href", "")
         title = fields.get("title", "")
         link = fields.get("link", "")
         guid = fields.get("guid") or fields.get("id") or link or title
-        entries.append({"title": title, "link": link, "guid": guid})
+        description = "\n".join(fields.get(k, "") for k in ("description", "summary", "content", "encoded"))
+        entries.append({"title": plain_text(title).strip(), "link": link, "guid": guid,
+                        "description": description})
     return entries
-
-
-def price_from_text(text: str):
-    # Accepte par exemple 499,99 €, 499.99 EUR ou 1 099 €.
-    matches_found = re.findall(r"(?<!\d)(\d{1,4}(?:[ .\u202f]\d{3})*(?:[,.]\d{1,2})?)\s*(?:€|eur(?![a-z]))", text, re.I)
-    if not matches_found:
-        return None
-    raw = matches_found[-1].replace("\u202f", "").replace(" ", "")
-    if "," in raw and "." in raw:
-        # Le dernier séparateur est la décimale; l'autre sépare les milliers.
-        decimal = "," if raw.rfind(",") > raw.rfind(".") else "."
-        grouping = "." if decimal == "," else ","
-        raw = raw.replace(grouping, "").replace(decimal, ".")
-    elif "," in raw:
-        raw = raw.replace(".", "").replace(",", ".")
-    elif "." in raw and len(raw.rsplit(".", 1)[-1]) == 3:
-        raw = raw.replace(".", "")
-    try:
-        val = float(raw)
-        return val if 1 <= val <= 20000 else None
-    except ValueError:
-        return None
 
 
 def price_limit_for_title(title: str, config: dict, fallback=None):
     """Return the category-specific ceiling matching this offer title."""
-    text = title.casefold()
     limits = config.get("price_limits_by_keyword", {})
-    matched = [float(limit) for keyword, limit in limits.items() if keyword.casefold() in text]
+    matched = [float(limit) for keyword, limit in limits.items() if has_keyword(title, keyword)]
     if matched:
         return min(matched)
     return fallback
@@ -182,6 +275,10 @@ def price_limit_for_title(title: str, config: dict, fallback=None):
 
 def rss_candidates(config: dict, env: dict):
     found = []
+    # Keep page verification within the three-minute Actions job, including
+    # when a feed has many offers or Dealabs is unavailable.
+    deadline = time.monotonic() + 80
+    verified = {}
     feeds = list(config.get("rss_feeds", []))
     # En hébergement GitHub Actions public, placer le flux Dealabs en secret
     # évite d'exposer son URL personnalisée dans le dépôt public.
@@ -200,13 +297,33 @@ def rss_candidates(config: dict, env: dict):
             for item in parse_feed(url):
                 if not matches(item["title"], config):
                     continue
-                price = price_from_text(item["title"])
+                ceiling = price_limit_for_title(item["title"], config, feed.get("max_price_eur"))
+                if ceiling is None:
+                    continue
+                if conditional_price(item["title"], item.get("description", "")):
+                    print("Offre ignorée : prix soumis à avantage différé ou condition.")
+                    continue
+                if dealabs_id(item["link"]) is None:
+                    print("Offre ignorée : aucune source de prix vérifiable prise en charge.")
+                    continue
+                if time.monotonic() >= deadline:
+                    print("Budget de vérification RSS atteint ; reprise au prochain passage.")
+                    return found
+                cache_key = (item["link"], item["title"], item.get("description", ""))
+                if cache_key not in verified:
+                    try:
+                        page = fetch(item["link"], headers={"User-Agent": "DealSentinel/1.1 (price verification)"},
+                                     timeout=min(8, max(1, deadline - time.monotonic())))
+                        verified[cache_key] = verified_dealabs_price(page.decode("utf-8"), item)
+                    except (OSError, ValueError, UnicodeError):
+                        verified[cache_key] = None
+                price = verified[cache_key]
                 if price is None:
+                    print("Offre ignorée : prix du produit non vérifié.")
                     continue
                 # Un flux RSS n'apporte pas à lui seul un historique fiable.
                 # On alerte seulement si le prix est inférieur au seuil configuré.
-                ceiling = price_limit_for_title(item["title"], config, feed.get("max_price_eur"))
-                if ceiling is None or price > float(ceiling):
+                if price > float(ceiling):
                     continue
                 found.append({"key": f"rss:{item['guid']}", "title": item["title"], "price": price,
                               "reference": None, "drop": None, "url": item["link"], "source": name})
@@ -230,7 +347,7 @@ def format_alert(d: dict):
         detail = f"Prix actuel : {d['price']:.2f} €\nMoyenne Keepa sur 90 jours : {d['reference']:.2f} €\nÉcart : −{d['drop']:.0f} %"
         label = "🚨 Grosse anomalie de prix à vérifier"
     else:
-        detail = f"Prix repéré : {d['price']:.2f} €\nSeuil personnalisé atteint"
+        detail = f"Prix de l'article déclaré par Dealabs : {d['price']:.2f} €\nSeuil personnalisé atteint (hors livraison)"
         label = "🔎 Offre repérée dans un flux"
     return f"{label}\n\n{d['title']}\n{detail}\nSource : {d['source']}\n{d['url']}\n\nVérifiez le modèle, l'état, le vendeur, les frais de livraison et le prix final avant achat."
 
